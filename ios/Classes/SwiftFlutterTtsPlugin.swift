@@ -277,19 +277,46 @@ public class SwiftFlutterTtsPlugin: NSObject, FlutterPlugin, AVSpeechSynthesizer
     }
   }
 
-  private func setSharedInstance(sharedInstance: Bool, result: FlutterResult) {
-      do {
-          // Deactivating without notifying leaves other apps ducked until
-          // someone else deactivates with the option.
-          if sharedInstance {
-              try AVAudioSession.sharedInstance().setActive(true)
-          } else {
-              try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+  private func setSharedInstance(sharedInstance: Bool, result: @escaping FlutterResult) {
+      // Off the main thread: setActive blocks (~0.9 s to deactivate after
+      // speech), and main is also Flutter's UI thread.
+      sessionQueue.async {
+          var ok = 1
+          do {
+              // Deactivating without notifying leaves other apps ducked until
+              // someone else deactivates with the option.
+              if sharedInstance {
+                  try AVAudioSession.sharedInstance().setActive(true)
+              } else {
+                  try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+              }
+          } catch {
+              ok = 0
           }
-          result(1)
-      } catch {
-          result(0)
+          DispatchQueue.main.async { result(ok) }
       }
+  }
+
+  /// Every activation and deactivation goes through here, in order and off
+  /// the main thread.
+  private let sessionQueue = DispatchQueue(label: "flutter_tts.audio_session")
+
+  /// Releases the session in the background, notifying ducked apps, and then
+  /// runs [then] on main. Only when the category ducks, like didFinish did.
+  private func releaseSession(then: @escaping () -> Void) {
+    guard shouldDeactivateAndNotifyOthers(audioSession) && self.autoStopSharedSession else {
+      then()
+      return
+    }
+    let session = audioSession
+    sessionQueue.async {
+      do {
+        try session.setActive(false, options: .notifyOthersOnDeactivation)
+      } catch {
+        print(error)
+      }
+      DispatchQueue.main.async(execute: then)
+    }
   }
 
   private func setAudioCategory(audioCategory: String?, audioOptions: Array<String>?, audioMode: String?, result: FlutterResult){
@@ -437,22 +464,18 @@ public class SwiftFlutterTtsPlugin: NSObject, FlutterPlugin, AVSpeechSynthesizer
   }
 
   public func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-    if shouldDeactivateAndNotifyOthers(audioSession) && self.autoStopSharedSession {
-      do {
-        try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
-      } catch {
-        print(error)
+    releaseSession { [weak self] in
+      guard let self = self else { return }
+      if self.awaitSpeakCompletion && self.speakResult != nil {
+          self.speakResult!(1)
+          self.speakResult = nil
       }
+      if self.awaitSynthCompletion && self.synthResult != nil {
+        self.synthResult!(1)
+        self.synthResult = nil
+      }
+      self.channel.invokeMethod("speak.onComplete", arguments: nil)
     }
-    if self.awaitSpeakCompletion && self.speakResult != nil {
-        self.speakResult!(1)
-        self.speakResult = nil
-    }
-    if self.awaitSynthCompletion && self.synthResult != nil {
-      self.synthResult!(1)
-      self.synthResult = nil
-    }
-    self.channel.invokeMethod("speak.onComplete", arguments: nil)
   }
 
   public func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
@@ -473,14 +496,9 @@ public class SwiftFlutterTtsPlugin: NSObject, FlutterPlugin, AVSpeechSynthesizer
     // stopSpeaking fails with running I/Os and leaves them ducked.
     // Done before notifying Dart, so a listener that waits for onCancel
     // finds the session already released.
-    if shouldDeactivateAndNotifyOthers(audioSession) && self.autoStopSharedSession {
-      do {
-        try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
-      } catch {
-        print(error)
-      }
+    releaseSession { [weak self] in
+      self?.channel.invokeMethod("speak.onCancel", arguments: nil)
     }
-    self.channel.invokeMethod("speak.onCancel", arguments: nil)
   }
 
   public func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, willSpeakRangeOfSpeechString characterRange: NSRange, utterance: AVSpeechUtterance) {
