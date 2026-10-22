@@ -279,7 +279,13 @@ public class SwiftFlutterTtsPlugin: NSObject, FlutterPlugin, AVSpeechSynthesizer
 
   private func setSharedInstance(sharedInstance: Bool, result: FlutterResult) {
       do {
-          try AVAudioSession.sharedInstance().setActive(sharedInstance)
+          // Deactivating without notifying leaves other apps ducked until
+          // someone else deactivates with the option.
+          if sharedInstance {
+              try AVAudioSession.sharedInstance().setActive(true)
+          } else {
+              try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+          }
           result(1)
       } catch {
           result(0)
@@ -462,6 +468,18 @@ public class SwiftFlutterTtsPlugin: NSObject, FlutterPlugin, AVSpeechSynthesizer
   }
 
   public func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+    // Same as didFinish: once the synthesizer has really stopped, release the
+    // session and let ducked apps come back. Deactivating right after
+    // stopSpeaking fails with running I/Os and leaves them ducked.
+    // Done before notifying Dart, so a listener that waits for onCancel
+    // finds the session already released.
+    if shouldDeactivateAndNotifyOthers(audioSession) && self.autoStopSharedSession {
+      do {
+        try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+      } catch {
+        print(error)
+      }
+    }
     self.channel.invokeMethod("speak.onCancel", arguments: nil)
   }
 
