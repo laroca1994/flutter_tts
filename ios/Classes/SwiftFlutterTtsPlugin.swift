@@ -303,41 +303,55 @@ public class SwiftFlutterTtsPlugin: NSObject, FlutterPlugin, AVSpeechSynthesizer
 
   /// Releases the session in the background, notifying ducked apps, and then
   /// runs [then] on main. Only when the category ducks, like didFinish did.
+  ///
+  /// Even reading the category waits while the queue is changing it (over a
+  /// second with audio running), so it is read in the queue too: read here,
+  /// on main, it froze the UI.
   private func releaseSession(then: @escaping () -> Void) {
-    guard shouldDeactivateAndNotifyOthers(audioSession) && self.autoStopSharedSession else {
+    guard self.autoStopSharedSession else {
       then()
       return
     }
     let session = audioSession
     sessionQueue.async {
-      do {
-        try session.setActive(false, options: .notifyOthersOnDeactivation)
-      } catch {
-        print(error)
+      if self.shouldDeactivateAndNotifyOthers(session) {
+        do {
+          try session.setActive(false, options: .notifyOthersOnDeactivation)
+        } catch {
+          print(error)
+        }
       }
       DispatchQueue.main.async(execute: then)
     }
   }
 
-  private func setAudioCategory(audioCategory: String?, audioOptions: Array<String>?, audioMode: String?, result: FlutterResult){
-    let category: AVAudioSession.Category = AudioCategory(rawValue: audioCategory ?? "")?.toAVAudioSessionCategory() ?? audioSession.category
-    let options: AVAudioSession.CategoryOptions = audioOptions?.reduce([], { (result, option) -> AVAudioSession.CategoryOptions in
-      return result.union(AudioCategoryOptions(rawValue: option)?.toAVAudioSessionCategoryOptions() ?? [])}) ?? []
-    do {
-        if #available(iOS 12.0, *) {
-            if audioMode == nil {
-                try audioSession.setCategory(category, options: options)
-            } else {
-                let mode: AVAudioSession.Mode? = AudioModes(rawValue: audioMode ?? "")?.toAVAudioSessionMode() ?? AVAudioSession.Mode.default
-                try audioSession.setCategory(category, mode: mode!, options: options)
-            }
-        } else {
-            try audioSession.setCategory(category, options: options)
+  /// In the session queue, like activating and releasing it: changing the
+  /// category before a release that is still pending would apply it to the
+  /// session being released. Setting the same category, mode and options
+  /// again is skipped, so claiming the session before every utterance does
+  /// not reconfigure it while it is active.
+  private func setAudioCategory(audioCategory: String?, audioOptions: Array<String>?, audioMode: String?, result: @escaping FlutterResult){
+    let session = audioSession
+    sessionQueue.async {
+      let category: AVAudioSession.Category = AudioCategory(rawValue: audioCategory ?? "")?.toAVAudioSessionCategory() ?? session.category
+      let options: AVAudioSession.CategoryOptions = audioOptions?.reduce([], { (result, option) -> AVAudioSession.CategoryOptions in
+        return result.union(AudioCategoryOptions(rawValue: option)?.toAVAudioSessionCategoryOptions() ?? [])}) ?? []
+      let mode: AVAudioSession.Mode? = audioMode == nil ? nil : AudioModes(rawValue: audioMode ?? "")?.toAVAudioSessionMode() ?? AVAudioSession.Mode.default
+      var ok = 1
+      let same = session.category == category && session.categoryOptions == options && (mode == nil || session.mode == mode)
+      if !same {
+        do {
+          if #available(iOS 12.0, *), let mode = mode {
+            try session.setCategory(category, mode: mode, options: options)
+          } else {
+            try session.setCategory(category, options: options)
+          }
+        } catch {
+          print(error)
+          ok = 0
         }
-      result(1)
-    } catch {
-      print(error)
-      result(0)
+      }
+      DispatchQueue.main.async { result(ok) }
     }
   }
 
